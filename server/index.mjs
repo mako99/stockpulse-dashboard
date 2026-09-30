@@ -23,7 +23,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { RELIANCE, TIMEFRAMES, num, signed, signedPct, groupIN, compactIN } from "../src/stockData.js";
 import { NIFTY50, SECTORS, PEERS, FALLBACK_LISTS, INDICES, RANGES } from "./universe.mjs";
-import { fetchQuotes, fetchChart, fetchSummary, fetchSearch, fetchNews, isMarketOpen, providerInfo } from "./yahoo.mjs";
+import { fetchQuotes, fetchChart, fetchSummary, fetchSearch, fetchNews, isMarketOpen, providerInfo } from "./provider.mjs";
 import { fetchAllIndices, pickIndex } from "./nse.mjs";
 import { cacheStats } from "./util.mjs";
 
@@ -126,7 +126,7 @@ async function buildSectors() {
   } catch { /* fall through */ }
   try {                                                // tier 2: average live member quotes
     const members = [...new Set(SECTORS.flatMap(([, syms]) => syms))];
-    const { quotes } = await fetchQuotes(members);
+    const { quotes, source: qSrc } = await fetchQuotes(members);
     const bySym = new Map(quotes.map((q) => [q.sym, q]));
     let live = 0;
     const out = SECTORS.map(([name, syms], i) => {
@@ -136,7 +136,7 @@ async function buildSectors() {
       const avg = ps.reduce((a, b) => a + b, 0) / ps.length;
       return [name, pctStr(+avg.toFixed(2)), dirOf(avg)];
     });
-    if (live >= SECTORS.length - 4) return { source: "yahoo", sectors: out };
+    if (live >= SECTORS.length - 4) return { source: qSrc || "yahoo", sectors: out };
   } catch { /* fall through */ }
   return { source: "sample", sectors: SAMPLE_SECTORS };
 }
@@ -205,7 +205,7 @@ async function buildChart(sym, rangeKey) {
     });
     const m = main.meta || {};
     return {
-      source: "yahoo", symbol: sym, range: rangeKey, axis: cfg.axis, bars,
+      source: main.source || "yahoo", symbol: sym, range: rangeKey, axis: cfg.axis, bars,
       meta: {
         price: m.regularMarketPrice, prevClose: m.previousClose ?? m.chartPreviousClose,
         high52: m.fiftyTwoWeekHigh, low52: m.fiftyTwoWeekLow,

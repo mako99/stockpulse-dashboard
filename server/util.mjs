@@ -92,7 +92,7 @@ const openCooldown = (key, ms) => {
 };
 const coolingLeft = (key) => Math.max(0, (cooldowns.get(key) || 0) - Date.now());
 
-export async function upstream(url, { cookie, timeoutMs = 9000, tries = 3, headers = {}, anyStatus = false } = {}) {
+export async function upstream(url, { cookie, timeoutMs = 9000, tries = 3, headers = {}, anyStatus = false, noThrow = false } = {}) {
   const key = keyOf(url);
   // This endpoint is cooling down? Fail fast so callers can serve stale/sample
   // data (or try a different endpoint) instead of parking the HTTP request.
@@ -120,6 +120,16 @@ export async function upstream(url, { cookie, timeoutMs = 9000, tries = 3, heade
         signal: ctrl.signal
       });
       const text = await res.text();
+
+      // Callers that need the response BODY to report errors accurately opt out
+      // of the retry/cooldown machinery (`noThrow`). Twelve Data returns its own
+      // {"status":"error"} envelope, and retrying a spent credit quota is
+      // pointless — it only resets on the minute boundary.
+      if (noThrow) {
+        stats.lastUpstreamAt = Date.now();
+        logUpstream(url, res.status, "");
+        return { text, status: res.status, cookie: res.headers.get("set-cookie"), headers: res.headers };
+      }
 
       if (res.status === 429) {
         stats.rateLimited++;
@@ -161,7 +171,7 @@ export async function upstream(url, { cookie, timeoutMs = 9000, tries = 3, heade
       }
       stats.lastUpstreamAt = Date.now();
       logUpstream(url, res.status, "");
-      return { text, status: res.status, cookie: res.headers.get("set-cookie") };
+      return { text, status: res.status, cookie: res.headers.get("set-cookie"), headers: res.headers };
     } catch (err) {
       if (err.code === 401 || err.code === 403 || err.code === 429) throw err;
       if (!err.code) {

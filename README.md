@@ -40,6 +40,61 @@ Charting note: the candlestick and volume series are drawn with hand-rolled SVG 
 Recharts has no candle series and a second charting library wasn't worth the dependency.
 Recharts still powers the market/financial bar charts.
 
+## Market data providers
+
+The server layers providers so no single upstream can blank a panel:
+
+| Source | Used for | Key needed |
+|---|---|---|
+| **NSE** (`server/nse.mjs`) | Index + sector rows | no |
+| **Twelve Data** (`server/twelvedata.mjs`) | Live quotes, charts | `TWELVEDATA_API_KEY` |
+| **Yahoo** (`server/yahoo.mjs`) | Quotes, charts, search, news, fundamentals | no |
+
+Yahoo needs no key but **rate-limits datacenter IPs hard** — the same code that
+works on a home connection returns `429` from a cloud host. Setting
+`TWELVEDATA_API_KEY` puts a keyed API in front of it, which fixes that.
+
+`server/provider.mjs` owns the choice: Twelve Data is tried first for quotes and
+charts, and *any* failure falls back to Yahoo — so a spent credit quota degrades
+to slower/labelled-sample data rather than an error. Yahoo remains the only
+source for news and fundamentals (Twelve Data has no free equivalent).
+
+### Enabling it
+
+Get a free key at <https://twelvedata.com/pricing>, then:
+
+```bash
+TWELVEDATA_API_KEY=your_key_here npm run dev:all      # locally
+railway variable set TWELVEDATA_API_KEY --stdin       # on Railway (paste key)
+```
+
+Tuning knobs (all optional, sane defaults shown):
+
+```bash
+TWELVEDATA_CREDITS_PER_MIN=8      # free plan = 8; raise if you upgrade
+TWELVEDATA_CREDITS_PER_DAY=800    # free plan resets to 800 at 00:00 UTC
+TWELVEDATA_BATCH=8                # symbols per request (each costs 1 credit)
+TWELVEDATA_QUOTE_TTL_MS=60000     # every refresh is paid for in credits
+TWELVEDATA_CHART_TTL_MS=600000
+TWELVEDATA_API_URL=https://api.twelvedata.com   # override for testing
+```
+
+**Why the budget logic matters:** `/quote` and `/time_series` cost **1 credit per
+symbol**, the quota resets each minute, and the free plan also caps the day. The
+adapter therefore reserves the whole symbol set *before* any request and refuses
+rather than half-fetching, so a shortfall never wastes credits or returns a
+partial answer. Because the full NIFTY-50 list needs ~50 credits, those panels
+keep using Yahoo/NSE on the free plan — the budget protects the watchlist and
+stock-detail quotes that matter most. Raise `TWELVEDATA_CREDITS_PER_MIN` on a paid
+plan and the panels move over automatically.
+
+`GET /api/health` reports what's in play, including live credit usage:
+
+```json
+{ "provider": { "active": "twelvedata+yahoo",
+                "twelvedata": { "perMinute": 8, "usedThisMinute": 4, "leftThisMinute": 4 } } }
+```
+
 ## Notes
 - The UI is responsive and includes mobile navigation.
 - Charts use Recharts (plus the custom SVG candlestick chart noted above).
