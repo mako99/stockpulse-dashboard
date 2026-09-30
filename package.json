@@ -19,6 +19,7 @@
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",
+    "railway": "^3.12.0",
     "vite": "^6.0.1"
   }
 }
