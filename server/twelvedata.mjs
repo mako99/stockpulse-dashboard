@@ -63,9 +63,25 @@ export function creditState() {
   return {
     perMinute, usedThisMinute: minute.used, leftThisMinute: Math.max(0, perMinute - minute.used),
     perDay, usedToday: day.used, leftToday: Math.max(0, perDay - day.used),
-    apiCreditsUsed: lastCredits.used, apiCreditsLeft: lastCredits.left
+    apiCreditsUsed: lastCredits.used, apiCreditsLeft: lastCredits.left,
+    planBlocked: planBlocked(), planBlockedReason: planBlocked() ? planBlockReason : null
   };
 }
+
+/* --------------------------------------------------------- plan entitlement */
+/* The free/basic plan excludes whole exchanges — NSE (Indian equities) needs
+   Grow or Venture. When upstream says so, remember it: re-asking costs a round
+   trip on every single quote request and will keep failing. We retry the flag
+   after PLAN_RETRY_MS so an upgrade self-heals without a redeploy. */
+let planBlockedUntil = 0;
+let planBlockReason = null;
+const PLAN_RETRY_MS = Math.max(60000, Number(process.env.TWELVEDATA_PLAN_RETRY_MS || 6 * 3600 * 1000));
+const planBlocked = () => Date.now() < planBlockedUntil;
+const planError = () => Object.assign(
+  new Error(`twelvedata: plan does not include these symbols (${planBlockReason || "upgrade required"})`),
+  { code: 501, plan: true }
+);
+const isPlanMessage = (m) => /not available with your plan|available starting with the/i.test(String(m));
 
 const budgetError = (need, have) => {
   const e = new Error(`twelvedata credit budget short: need ${need}, ${have} left this minute`);
@@ -101,9 +117,12 @@ async function getJSON(pathAndQuery) {
   catch { throw Object.assign(new Error(`twelvedata: bad json (http ${r.status})`), { code: 502 }); }
   if (data && data.status === "error") {
     const raw = Number(data.code) || r.status || 502;
-    const e = new Error(`twelvedata ${raw}: ${String(data.message || "error").slice(0, 160)}`);
+    const msg = String(data.message || "error");
+    if (isPlanMessage(msg)) { planBlockedUntil = Date.now() + PLAN_RETRY_MS; planBlockReason = msg.slice(0, 200); }
+    const e = new Error(`twelvedata ${raw}: ${msg.slice(0, 160)}`);
     // 401/403 here means a bad or missing key — our config problem, not an outage.
     e.code = raw === 401 || raw === 403 ? 502 : raw;
+    if (isPlanMessage(msg)) e.plan = true;
     throw e;
   }
   if (r.status !== 200) {
@@ -151,18 +170,23 @@ const isIndexLike = (s) => s.startsWith("^") || s.includes("=");
 
 /* ------------------------------------------------------------------- quotes */
 /** Unpack either a multi-symbol response (object keyed by ticker) or a single
- *  quote object. Twelve Data returns both shapes from the same endpoint. */
+ *  quote object. NOTE: in a keyed response a failure is reported PER SYMBOL
+ *  (`{"RELIANCE": {"status":"error", ...}}`) with HTTP 200 — it is not a
+ *  top-level error envelope, so callers must inspect `errors` too. */
 function unpack(chunk, data) {
   const pairs = [];
+  const errors = [];
   if (data && typeof data === "object" && data.symbol == null) {
     for (const sym of chunk) {
       const raw = data[sym];
-      if (raw && typeof raw === "object" && raw.status !== "error") pairs.push([sym, raw]);
+      if (!raw || typeof raw !== "object") continue;
+      if (raw.status === "error") errors.push({ sym, ...raw });
+      else pairs.push([sym, raw]);
     }
-    return pairs;
+    return { pairs, errors };
   }
   if (chunk.length === 1 && data && data.symbol) pairs.push([chunk[0], data]);
-  return pairs;
+  return { pairs, errors };
 }
 
 /** Live quotes for NSE tickers (pass `RELIANCE`-style symbols). */
@@ -172,17 +196,31 @@ export async function fetchQuotes(symbols) {
   if (syms.some(isIndexLike)) {
     throw Object.assign(new Error("twelvedata: index/forex symbols unsupported"), { code: 501 });
   }
+  if (planBlocked()) throw planError();
   const { batch, quoteTtlMs } = cfg();
   const key = `td:q:${syms.slice().sort().join(",")}`;
   return cached(key, quoteTtlMs, async () => {
     reserve(syms.length);                       // all-or-nothing, before any I/O
     const out = [];
+    const errors = [];
     for (const chunk of chunkOf(syms, batch)) {
       const qs = chunk.map(encodeURIComponent).join(",");
       const data = await getJSON(`/quote?symbol=${qs}&exchange=NSE`);
-      for (const [sym, raw] of unpack(chunk, data)) {
+      const r = unpack(chunk, data);
+      errors.push(...r.errors);
+      for (const [sym, raw] of r.pairs) {
         const q = normQuote(sym, raw);
         if (q) out.push(q);
+      }
+    }
+    // Keyed responses report per-symbol failures inline — surface them, and
+    // remember a plan limitation so we stop paying a round trip for it.
+    if (errors.length) {
+      const msg = String(errors[0].message || "symbol error");
+      if (isPlanMessage(msg)) { planBlockedUntil = Date.now() + PLAN_RETRY_MS; planBlockReason = msg.slice(0, 200); }
+      if (!out.length) {
+        if (planBlocked()) throw planError();
+        throw Object.assign(new Error(`twelvedata: ${msg.slice(0, 160)}`), { code: 502 });
       }
     }
     if (!out.length) throw Object.assign(new Error("twelvedata: no quotes"), { code: 502 });
@@ -223,6 +261,7 @@ export async function fetchChart(sym, rangeKey = "1Y") {
   if (isIndexLike(s)) {
     throw Object.assign(new Error("twelvedata: index/forex symbols unsupported"), { code: 501 });
   }
+  if (planBlocked()) throw planError();
   const c = CHART[rangeKey] || CHART["1Y"];
   const { chartTtlMs } = cfg();
   return cached(`td:c:${s}:${rangeKey}`, chartTtlMs, async () => {
