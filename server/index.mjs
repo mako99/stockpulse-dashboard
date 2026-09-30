@@ -18,6 +18,9 @@
  * sample data (flagged) instead of an error — the dashboard never blanks.
  */
 import { createServer } from "node:http";
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { RELIANCE, TIMEFRAMES, num, signed, signedPct, groupIN, compactIN } from "../src/stockData.js";
 import { NIFTY50, SECTORS, PEERS, FALLBACK_LISTS, INDICES, RANGES } from "./universe.mjs";
 import { fetchQuotes, fetchChart, fetchSummary, fetchSearch, fetchNews, isMarketOpen, providerInfo } from "./yahoo.mjs";
@@ -493,6 +496,64 @@ function handleStream(req, res, url) {
   req.on("close", () => sseClients.delete(client));
 }
 
+/* ------------------------------------------------------ static (dist/) */
+// In production the same origin must serve the built SPA and the /api routes —
+// that keeps every relative fetch/EventSource path in api.js unchanged.
+const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const DIST_DIR = path.join(APP_ROOT, "dist");
+const MIME = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".map": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".ico": "image/x-icon",
+  ".txt": "text/plain; charset=utf-8",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".ttf": "font/ttf"
+};
+
+/** Serve files from dist/ with an SPA fallback to index.html. Returns false when
+ *  the request isn't a GET/HEAD, escapes dist/, or dist/ isn't built yet. */
+async function serveStatic(req, res, urlPath) {
+  if (req.method !== "GET" && req.method !== "HEAD") return false;
+  let decoded;
+  try { decoded = decodeURIComponent(urlPath); } catch { decoded = urlPath; }
+  let rel = decoded.replace(/^\/+/, "");
+  if (!rel) rel = "index.html";
+  const filePath = path.normalize(path.join(DIST_DIR, rel));
+  if (filePath !== DIST_DIR && !filePath.startsWith(DIST_DIR + path.sep)) return false;
+  const candidates = [];
+  try {
+    const st = await fs.stat(filePath);
+    candidates.push(st.isDirectory() ? path.join(filePath, "index.html") : filePath);
+  } catch { /* try the SPA fallback below */ }
+  candidates.push(path.join(DIST_DIR, "index.html"));
+  for (const candidate of candidates) {
+    try {
+      const data = await fs.readFile(candidate);
+      const type = MIME[path.extname(candidate).toLowerCase()] || "application/octet-stream";
+      res.writeHead(200, {
+        ...CORS,
+        "Content-Type": type,
+        "Content-Length": data.length,
+        "Cache-Control": type.startsWith("text/html") ? "no-cache" : "public, max-age=31536000, immutable"
+      });
+      res.end(req.method === "HEAD" ? undefined : data);
+      return true;
+    } catch { /* try the next candidate */ }
+  }
+  return false;
+}
+
 /* -------------------------------------------------------------------- router */
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -514,9 +575,9 @@ const server = createServer(async (req, res) => {
   const path = url.pathname;
   if (req.method === "OPTIONS") { res.writeHead(204, CORS); res.end(); return; }
   if (!path.startsWith("/api/")) {
-    const page = path === "/";
-    res.writeHead(page ? 200 : 404, { ...CORS, "Content-Type": "text/html; charset=utf-8" });
-    res.end(page ? "<!doctype html><meta charset='utf-8'><title>StockPulse API</title><body style='font:15px system-ui;background:#0b1722;color:#c9d6e2;padding:40px'><h1>StockPulse API</h1><p>See README for endpoints. The dashboard consumes them through Vite's <code>/api</code> proxy.</p>" : "Not found");
+    if (await serveStatic(req, res, path)) return;
+    res.writeHead(404, { ...CORS, "Content-Type": "text/html; charset=utf-8" });
+    res.end("Not found");
     return;
   }
   try {
